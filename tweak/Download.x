@@ -82,7 +82,6 @@ static NSArray<YTHStream *> *YTHCollectStreams(YTPlayerViewController *player, N
     if (titleOut) {
         NSString *title = nil;
         @try { title = [[video videoDetails] valueForKey:@"title"]; } @catch (NSException *e) {}
-        if (!title.length && [player respondsToSelector:@selector(contentVideoID)]) title = [player contentVideoID];
         *titleOut = title;
     }
     return streams;
@@ -122,8 +121,11 @@ static void YTHStartDownload(YTPlayerViewController *player, id sender) {
         if ([player respondsToSelector:@selector(isPlayingAd)] && player.isPlayingAd) return;
         NSString *title = nil;
         NSArray *streams = YTHCollectStreams(player, &title);
+        NSString *videoID = nil;
+        if ([player respondsToSelector:@selector(contentVideoID)]) videoID = [player contentVideoID];
+        if (!videoID.length && [player respondsToSelector:@selector(currentVideoID)]) videoID = [player currentVideoID];
         UIViewController *presenter = YTHTopViewController() ?: (UIViewController *)player;
-        [YTHDownloader downloadTitle:title ?: @"video" streams:streams maxHeight:YTHDownloadQuality() presenter:presenter];
+        [YTHDownloader downloadTitle:title videoID:videoID streams:streams maxHeight:YTHDownloadQuality() presenter:presenter];
     } @catch (NSException *e) {
         YTHShowError([NSString stringWithFormat:@"%@: %@\n\nPlease send this message to the YTHelper developer.", e.name, e.reason]);
     }

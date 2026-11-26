@@ -82,6 +82,7 @@ static BOOL YTHParseUnsatisfiedRange(NSString *header, long long *total) {
 @interface YTHRangeFetch : NSObject
 @property (nonatomic, weak) YTHDownloadJob *job;
 @property (nonatomic, strong) NSURL *url;
+@property (nonatomic, copy) NSString *userAgent;
 @property (nonatomic, strong) NSFileHandle *handle;
 @property (nonatomic, copy) NSString *label;
 @property (nonatomic, copy) void (^done)(NSError *);
@@ -104,6 +105,7 @@ static BOOL YTHParseUnsatisfiedRange(NSString *header, long long *total) {
     if (!job || job.cancelled) { [self finishWithError:YTHError(-999, @"Cancelled")]; return; }
     NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:self.url];
     [req setValue:[NSString stringWithFormat:@"bytes=%lld-%lld", self.offset, self.offset + YTHChunkSize - 1] forHTTPHeaderField:@"Range"];
+    if (self.userAgent.length) [req setValue:self.userAgent forHTTPHeaderField:@"User-Agent"];
     [[job.session dataTaskWithRequest:req completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
         [self handleData:data response:(NSHTTPURLResponse *)response error:error];
     }] resume];
@@ -174,8 +176,8 @@ static BOOL YTHParseUnsatisfiedRange(NSString *header, long long *total) {
     dispatch_async(dispatch_get_main_queue(), ^{ self.progressAlert.message = status; });
 }
 
-// Downloads url to file in 10 MB ranges. Calls done(error) on a background queue.
-- (void)fetch:(NSURL *)url to:(NSURL *)file label:(NSString *)label done:(void (^)(NSError *))done {
+// Downloads a stream to file in 10 MB ranges. Calls done(error) on a background queue.
+- (void)fetch:(YTHStream *)stream to:(NSURL *)file label:(NSString *)label done:(void (^)(NSError *))done {
     NSError *fileError = nil;
     if (![[NSFileManager defaultManager] createFileAtPath:file.path contents:nil attributes:nil]) {
         done(YTHError(3, @"Couldn't create a file for the download."));
@@ -188,7 +190,8 @@ static BOOL YTHParseUnsatisfiedRange(NSString *header, long long *total) {
     }
     YTHRangeFetch *fetch = [YTHRangeFetch new];
     fetch.job = self;
-    fetch.url = url;
+    fetch.url = stream.URL;
+    fetch.userAgent = stream.userAgent;
     fetch.handle = handle;
     fetch.label = label;
     fetch.done = done;
@@ -215,7 +218,76 @@ static NSString *YTHSafeFileName(NSString *title) {
     return name.length ? name : @"video";
 }
 
-+ (void)downloadTitle:(NSString *)title streams:(NSArray<YTHStream *> *)streams maxHeight:(NSInteger)maxHeight presenter:(UIViewController *)presenter {
+// ---------- Fallback: ask YouTube's player API for direct links ----------
+// The YouTube app on newer versions streams over SABR, which carries no plain stream URLs.
+// The Android VR client still gets plain URLs without extra tokens, so ask as that client.
+// These values follow yt-dlp's client list and may need bumping when YouTube changes them.
+static NSString *const YTHVRClientVersion = @"1.62.27";
+static NSString *YTHVRUserAgent(void) {
+    return [NSString stringWithFormat:@"com.google.android.apps.youtube.vr.oculus/%@ (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip", YTHVRClientVersion];
+}
+
++ (void)fetchStreamsForVideoID:(NSString *)videoID completion:(void (^)(NSArray<YTHStream *> *streams, NSString *title, NSError *error))completion {
+    NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:@"https://www.youtube.com/youtubei/v1/player?prettyPrint=false"]];
+    req.HTTPMethod = @"POST";
+    req.timeoutInterval = 30;
+    [req setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
+    [req setValue:YTHVRUserAgent() forHTTPHeaderField:@"User-Agent"];
+    [req setValue:@"28" forHTTPHeaderField:@"X-YouTube-Client-Name"];
+    [req setValue:YTHVRClientVersion forHTTPHeaderField:@"X-YouTube-Client-Version"];
+    NSDictionary *body = @{
+        @"context": @{ @"client": @{
+            @"clientName": @"ANDROID_VR", @"clientVersion": YTHVRClientVersion,
+            @"deviceMake": @"Oculus", @"deviceModel": @"Quest 3",
+            @"androidSdkVersion": @32, @"osName": @"Android", @"osVersion": @"12L",
+            @"hl": @"en", @"gl": @"US",
+        } },
+        @"videoId": videoID,
+        @"contentCheckOk": @YES,
+        @"racyCheckOk": @YES,
+    };
+    req.HTTPBody = [NSJSONSerialization dataWithJSONObject:body options:0 error:nil];
+
+    void (^finish)(NSArray *, NSString *, NSError *) = ^(NSArray *streams, NSString *title, NSError *error) {
+        dispatch_async(dispatch_get_main_queue(), ^{ completion(streams, title, error); });
+    };
+    [[NSURLSession.sharedSession dataTaskWithRequest:req completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
+        if (error) { finish(nil, nil, error); return; }
+        id json = data ? [NSJSONSerialization JSONObjectWithData:data options:0 error:nil] : nil;
+        if (![json isKindOfClass:NSDictionary.class]) {
+            finish(nil, nil, YTHError(6, [NSString stringWithFormat:@"YouTube's player API sent an unexpected reply (HTTP %ld).", (long)((NSHTTPURLResponse *)response).statusCode]));
+            return;
+        }
+        NSDictionary *playability = [json[@"playabilityStatus"] isKindOfClass:NSDictionary.class] ? json[@"playabilityStatus"] : nil;
+        NSString *status = playability[@"status"];
+        if (![status isEqual:@"OK"]) {
+            NSString *reason = [playability[@"reason"] isKindOfClass:NSString.class] ? playability[@"reason"] : (status ?: @"no reason given");
+            finish(nil, nil, YTHError(7, [NSString stringWithFormat:@"YouTube said: %@", reason]));
+            return;
+        }
+        NSMutableArray<YTHStream *> *streams = [NSMutableArray array];
+        NSDictionary *sd = [json[@"streamingData"] isKindOfClass:NSDictionary.class] ? json[@"streamingData"] : nil;
+        for (NSString *key in @[@"adaptiveFormats", @"formats"]) {
+            NSArray *formats = [sd[key] isKindOfClass:NSArray.class] ? sd[key] : nil;
+            for (NSDictionary *f in formats) {
+                if (![f isKindOfClass:NSDictionary.class]) continue;
+                NSNumber *itag = [f[@"itag"] isKindOfClass:NSNumber.class] ? f[@"itag"] : nil;
+                NSString *url = [f[@"url"] isKindOfClass:NSString.class] ? f[@"url"] : nil;
+                if (!itag || !url.length) continue; // ciphered formats have no plain url
+                YTHStream *s = [YTHStream new];
+                s.itag = itag.intValue;
+                s.URL = [NSURL URLWithString:url];
+                s.userAgent = YTHVRUserAgent();
+                if (s.URL) [streams addObject:s];
+            }
+        }
+        NSDictionary *details = [json[@"videoDetails"] isKindOfClass:NSDictionary.class] ? json[@"videoDetails"] : nil;
+        NSString *title = [details[@"title"] isKindOfClass:NSString.class] ? details[@"title"] : nil;
+        finish(streams, title, nil);
+    }] resume];
+}
+
++ (void)downloadTitle:(NSString *)title videoID:(NSString *)videoID streams:(NSArray<YTHStream *> *)streams maxHeight:(NSInteger)maxHeight presenter:(UIViewController *)presenter {
     if (gBusy) return;
 
     YTHStream *audio = nil;
@@ -231,8 +303,27 @@ static NSString *YTHSafeFileName(NSString *title) {
 
     BOOL audioOnly = maxHeight == 0;
     if ((audioOnly && !audio) || (!audioOnly && !(video && audio) && !progressive)) {
+        if (videoID.length) {
+            // The app has no usable links (SABR). Ask YouTube's player API, then try once more.
+            gBusy = YES;
+            UIAlertController *wait = [UIAlertController alertControllerWithTitle:@"Downloading" message:@"Getting download links…" preferredStyle:UIAlertControllerStyleAlert];
+            [presenter presentViewController:wait animated:YES completion:nil];
+            [self fetchStreamsForVideoID:videoID completion:^(NSArray<YTHStream *> *apiStreams, NSString *apiTitle, NSError *error) {
+                gBusy = NO;
+                [wait dismissViewControllerAnimated:YES completion:^{
+                    if (error) {
+                        UIAlertController *a = [UIAlertController alertControllerWithTitle:@"Can't download this video" message:error.localizedDescription preferredStyle:UIAlertControllerStyleAlert];
+                        [a addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
+                        [presenter presentViewController:a animated:YES completion:nil];
+                        return;
+                    }
+                    [self downloadTitle:(title.length ? title : apiTitle) videoID:nil streams:apiStreams maxHeight:maxHeight presenter:presenter];
+                }];
+            }];
+            return;
+        }
         UIAlertController *a = [UIAlertController alertControllerWithTitle:@"Can't download this video"
-            message:@"YouTube didn't give the app a downloadable stream for it. This happens when YouTube streams in a format the downloader can't read yet (SABR), or for live, premium or age-restricted videos."
+            message:@"Neither the app nor YouTube's player API gave a downloadable stream for this video. This can happen for live, premium or age-restricted videos, or when YouTube changes how it serves videos."
             preferredStyle:UIAlertControllerStyleAlert];
         [a addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
         [presenter presentViewController:a animated:YES completion:nil];
@@ -302,7 +393,7 @@ static NSString *YTHSafeFileName(NSString *title) {
     NSURL *videoFile = [rawDir URLByAppendingPathComponent:@"video.mp4"];
 
     if (audioOnly) {
-        [job fetch:audio.URL to:audioFile label:@"Audio" done:^(NSError *error) {
+        [job fetch:audio to:audioFile label:@"Audio" done:^(NSError *error) {
             if (error) { finish(nil, error); return; }
             NSURL *out = [outDir URLByAppendingPathComponent:[job.title stringByAppendingPathExtension:@"m4a"]];
             [job setStatus:@"Saving…"];
@@ -313,7 +404,7 @@ static NSString *YTHSafeFileName(NSString *title) {
 
     if (!(video && audio)) {
         // Only the 360p progressive file is available; it already has sound.
-        [job fetch:progressive.URL to:videoFile label:@"Video" done:^(NSError *error) {
+        [job fetch:progressive to:videoFile label:@"Video" done:^(NSError *error) {
             if (error) { finish(nil, error); return; }
             NSURL *out = [outDir URLByAppendingPathComponent:[job.title stringByAppendingPathExtension:@"mp4"]];
             NSError *moveError = nil;
@@ -323,9 +414,9 @@ static NSString *YTHSafeFileName(NSString *title) {
         return;
     }
 
-    [job fetch:video.URL to:videoFile label:@"Video" done:^(NSError *error) {
+    [job fetch:video to:videoFile label:@"Video" done:^(NSError *error) {
         if (error) { finish(nil, error); return; }
-        [job fetch:audio.URL to:audioFile label:@"Audio" done:^(NSError *error2) {
+        [job fetch:audio to:audioFile label:@"Audio" done:^(NSError *error2) {
             if (error2) { finish(nil, error2); return; }
             [job setStatus:@"Merging…"];
             NSURL *out = [outDir URLByAppendingPathComponent:[job.title stringByAppendingPathExtension:@"mp4"]];
