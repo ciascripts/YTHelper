@@ -6,7 +6,7 @@ tweak/Ads.x contains code adapted from YouTube-X by PoomSmart
 tweak/Settings.x follows the settings-section pattern of YTUHD by PoomSmart.
 
 Built from source at pinned commits by .github/workflows/build-ipa.yml (not stored in this repo):
-- YTUHD, YTVideoOverlay, YouGroupSettings, YouTubeHeader by PoomSmart: MIT License (below).
+- YTUHD, YTVideoOverlay, YouGroupSettings, IAmYouTube, YouTubeHeader by PoomSmart: MIT License (below).
 - PSHeader by PoomSmart: no license file in the repository. It is only downloaded as build-time
   headers and is not stored in this repository.
 - Theos (https://github.com/theos/theos): GPL-3.0, build tool only.
