@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>{{IN_APP_NAME}}</title>
+  <meta name="theme-color" content="#0f0f0f">
+  <!-- Home Screen name + icon (read by iOS/Android when the app is installed) -->
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-title" content="{{HOME_NAME}}">
+  <meta name="application-name" content="{{HOME_NAME}}">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <link rel="manifest" href="/manifest.webmanifest?v={{ICON_V}}">
+  <link rel="apple-touch-icon" href="/icons/home-180.png?v={{ICON_V}}">
+  <link rel="icon" href="/icons/inapp-32.png?v={{ICON_V}}">
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <header>
+    <a class="brand" href="#/">
+      <img id="brandIcon" src="/icons/inapp-192.png?v={{ICON_V}}" alt="">
+      <span id="brandName">{{IN_APP_NAME}}</span>
+    </a>
+    <form id="searchForm" role="search">
+      <input id="q" type="search" placeholder="Search" autocomplete="off">
+    </form>
+    <button id="settingsBtn" class="icon-btn" aria-label="Settings">⚙</button>
+  </header>
+
+  <main id="view"></main>
+
+  <dialog id="settings">
+    <form method="dialog" id="settingsForm">
+      <h2>Settings</h2>
+
+      <fieldset>
+        <legend>App name</legend>
+        <label>In app <input name="inAppName" maxlength="40"></label>
+        <label>Home Screen <input name="homeName" maxlength="40"></label>
+      </fieldset>
+
+      <fieldset>
+        <legend>App picture</legend>
+        <div class="icon-row">
+          <img id="inappPreview" alt="In-app icon">
+          <label class="file">In app <input type="file" accept="image/*" data-kind="inapp"></label>
+          <button type="button" data-reset="inapp">Reset</button>
+        </div>
+        <div class="icon-row">
+          <img id="homePreview" alt="Home Screen icon">
+          <label class="file">Home Screen <input type="file" accept="image/*" data-kind="home"></label>
+          <button type="button" data-reset="home">Reset</button>
+        </div>
+        <p class="hint" id="installHint"></p>
+      </fieldset>
+
+      <fieldset>
+        <legend>Playback</legend>
+        <label class="switch"><input type="checkbox" name="adsEnabled"> Show ads (official YouTube player)</label>
+        <label>Max quality
+          <select name="maxHeight">
+            <option value="2160">4K (2160p)</option>
+            <option value="1440">1440p</option>
+            <option value="1080">1080p</option>
+            <option value="720">720p</option>
+            <option value="480">480p</option>
+          </select>
+        </label>
+        <label>Max frame rate
+          <select name="maxFps">
+            <option value="60">60 fps</option>
+            <option value="30">30 fps</option>
+          </select>
+        </label>
+      </fieldset>
+
+      <menu>
+        <button value="cancel" formnovalidate>Close</button>
+        <button id="saveSettings" value="save" class="primary">Save</button>
+      </menu>
+    </form>
+  </dialog>
+
+  <script src="/app.js" type="module"></script>
+</body>
+</html>
