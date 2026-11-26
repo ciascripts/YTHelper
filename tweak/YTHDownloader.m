@@ -1,5 +1,8 @@
 #import "YTHDownloader.h"
 #import <AVFoundation/AVFoundation.h>
+#include <ctype.h>
+#include <limits.h>
+#include <string.h>
 
 @implementation YTHStream
 @end
@@ -23,29 +26,152 @@ static BOOL gBusy;
 @property (nonatomic, copy) NSString *title;
 @property (nonatomic, strong) NSURL *workDir;
 @property (atomic, assign) BOOL cancelled;
+- (void)setStatus:(NSString *)status;
+@end
+
+static NSError *YTHError(NSInteger code, NSString *message) {
+    return [NSError errorWithDomain:@"YTHelper" code:code userInfo:@{NSLocalizedDescriptionKey: message}];
+}
+
+static BOOL YTHReadNumber(const char **p, long long *out) {
+    const char *s = *p;
+    if (!isdigit((unsigned char)*s)) return NO;
+    long long v = 0;
+    while (isdigit((unsigned char)*s)) {
+        if (v > (LLONG_MAX - 9) / 10) return NO; // overflow
+        v = v * 10 + (*s++ - '0');
+    }
+    *out = v;
+    *p = s;
+    return YES;
+}
+
+// Strictly parses "bytes START-END/TOTAL" or "bytes START-END/*" (total = -1 for "*").
+// Rejects anything else, including a missing "/TOTAL", END < START or END >= TOTAL.
+static BOOL YTHParseContentRange(NSString *header, long long *start, long long *end, long long *total) {
+    const char *h = header.UTF8String;
+    if (!h || strncmp(h, "bytes ", 6) != 0) return NO;
+    const char *p = h + 6;
+    long long s, e, t = -1;
+    if (!YTHReadNumber(&p, &s) || *p++ != '-' || !YTHReadNumber(&p, &e) || *p++ != '/') return NO;
+    if (*p == '*') p++;
+    else if (!YTHReadNumber(&p, &t)) return NO;
+    while (*p == ' ' || *p == '\t') p++;
+    if (*p != '\0' || e < s || (t >= 0 && e >= t)) return NO;
+    *start = s;
+    *end = e;
+    *total = t;
+    return YES;
+}
+
+// Strictly parses the 416 form "bytes */TOTAL".
+static BOOL YTHParseUnsatisfiedRange(NSString *header, long long *total) {
+    const char *h = header.UTF8String;
+    if (!h || strncmp(h, "bytes */", 8) != 0) return NO;
+    const char *p = h + 8;
+    long long t;
+    if (!YTHReadNumber(&p, &t)) return NO;
+    while (*p == ' ' || *p == '\t') p++;
+    if (*p != '\0') return NO;
+    *total = t;
+    return YES;
+}
+
+// Downloads one URL to one file in 10 MB ranges. Each request's completion handler
+// keeps this object alive until the next request starts, so no block refers to itself.
+@interface YTHRangeFetch : NSObject
+@property (nonatomic, weak) YTHDownloadJob *job;
+@property (nonatomic, strong) NSURL *url;
+@property (nonatomic, strong) NSFileHandle *handle;
+@property (nonatomic, copy) NSString *label;
+@property (nonatomic, copy) void (^done)(NSError *);
+@property (nonatomic, assign) long long offset;
+@property (nonatomic, assign) long long total;
+- (void)next;
+@end
+
+@implementation YTHRangeFetch
+
+- (void)finishWithError:(NSError *)error {
+    [self.handle closeAndReturnError:nil];
+    void (^done)(NSError *) = self.done;
+    self.done = nil; // call at most once
+    if (done) done(error);
+}
+
+- (void)next {
+    YTHDownloadJob *job = self.job;
+    if (!job || job.cancelled) { [self finishWithError:YTHError(-999, @"Cancelled")]; return; }
+    NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:self.url];
+    [req setValue:[NSString stringWithFormat:@"bytes=%lld-%lld", self.offset, self.offset + YTHChunkSize - 1] forHTTPHeaderField:@"Range"];
+    [[job.session dataTaskWithRequest:req completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
+        [self handleData:data response:(NSHTTPURLResponse *)response error:error];
+    }] resume];
+}
+
+- (void)handleData:(NSData *)data response:(NSHTTPURLResponse *)http error:(NSError *)error {
+    if (!error && http.statusCode == 416) {
+        // "Range not satisfiable": only a success if it confirms the file ends exactly here.
+        long long confirmed = -1;
+        if (YTHParseUnsatisfiedRange([http valueForHTTPHeaderField:@"Content-Range"], &confirmed) &&
+            confirmed == self.offset && (self.total < 0 || self.total == confirmed)) {
+            self.total = confirmed;
+            [self finishWithError:nil];
+        } else {
+            [self finishWithError:YTHError(5, @"YouTube sent an unexpected part of the file. Try again.")];
+        }
+        return;
+    }
+    if (error || (http.statusCode != 200 && http.statusCode != 206) || data.length == 0) {
+        // Pass network errors through unchanged so a cancel keeps code -999.
+        [self finishWithError:error ?: YTHError(http.statusCode,
+            [NSString stringWithFormat:@"YouTube refused the download (HTTP %ld).", (long)http.statusCode])];
+        return;
+    }
+    NSError *writeError = nil;
+    if (http.statusCode == 200) {
+        // The server ignored Range and sent the whole file. Whatever we wrote before is
+        // replaced so the output can't contain earlier chunks plus a full copy.
+        if (![self.handle truncateAtOffset:0 error:&writeError] || ![self.handle writeData:data error:&writeError]) {
+            [self finishWithError:writeError ?: YTHError(4, @"Couldn't write the download to storage.")];
+            return;
+        }
+        self.offset = self.total = data.length;
+        [self finishWithError:nil];
+        return;
+    }
+    // A 206 must describe exactly the bytes we got, starting where we left off, and must not
+    // change the file size mid-download. Otherwise a short body could look like a finished file.
+    long long start = -1, end = -1, rangeTotal = -1;
+    if (!YTHParseContentRange([http valueForHTTPHeaderField:@"Content-Range"], &start, &end, &rangeTotal) ||
+        start != self.offset ||
+        (long long)data.length != end - start + 1 ||
+        (self.total >= 0 && rangeTotal >= 0 && rangeTotal != self.total) ||
+        (self.total >= 0 && end >= self.total)) {
+        [self finishWithError:YTHError(5, @"YouTube sent an unexpected part of the file. Try again.")];
+        return;
+    }
+    if (![self.handle writeData:data error:&writeError]) {
+        [self finishWithError:writeError ?: YTHError(4, @"Couldn't write the download to storage.")];
+        return;
+    }
+    self.offset += data.length;
+    if (rangeTotal >= 0) self.total = rangeTotal;
+    if (self.total > 0)
+        [self.job setStatus:[NSString stringWithFormat:@"%@ %d%%", self.label, (int)(self.offset * 100 / self.total)]];
+    // Finished only when a known total is reached. With an unknown ("*") total, or when the
+    // server caps responses below our chunk size, keep asking from the next offset; the end
+    // is then confirmed by a total in a later response or by a 416 "bytes */N" at N.
+    if (self.total >= 0 && self.offset >= self.total) [self finishWithError:nil];
+    else [self next];
+}
+
 @end
 
 @implementation YTHDownloadJob
 
 - (void)setStatus:(NSString *)status {
     dispatch_async(dispatch_get_main_queue(), ^{ self.progressAlert.message = status; });
-}
-
-static NSError *YTHError(NSInteger code, NSString *message) {
-    return [NSError errorWithDomain:@"YTHelper" code:code userInfo:@{NSLocalizedDescriptionKey: message}];
-}
-
-// Parses "bytes START-END/TOTAL". Returns NO if the header is missing or malformed.
-static BOOL YTHParseContentRange(NSString *header, long long *start, long long *total) {
-    NSScanner *scanner = [NSScanner scannerWithString:header ?: @""];
-    long long s = -1, e = -1, t = -1;
-    if (![scanner scanString:@"bytes" intoString:nil] || ![scanner scanLongLong:&s] ||
-        ![scanner scanString:@"-" intoString:nil] || ![scanner scanLongLong:&e] ||
-        ![scanner scanString:@"/" intoString:nil]) return NO;
-    if (![scanner scanLongLong:&t]) t = -1; // "*" means unknown total
-    *start = s;
-    *total = t;
-    return YES;
 }
 
 // Downloads url to file in 10 MB ranges. Calls done(error) on a background queue.
@@ -60,58 +186,14 @@ static BOOL YTHParseContentRange(NSString *header, long long *start, long long *
         done(fileError ?: YTHError(3, @"Couldn't open the download file."));
         return;
     }
-    __block long long offset = 0, total = -1;
-    __block void (^next)(void);
-    __weak typeof(self) weakSelf = self;
-    void (^finishFetch)(NSError *) = ^(NSError *error) {
-        [handle closeAndReturnError:nil];
-        next = nil; // break the self-referencing block
-        done(error);
-    };
-    next = ^{
-        typeof(self) job = weakSelf;
-        if (!job || job.cancelled) { finishFetch(YTHError(-999, @"Cancelled")); return; }
-        NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:url];
-        [req setValue:[NSString stringWithFormat:@"bytes=%lld-%lld", offset, offset + YTHChunkSize - 1] forHTTPHeaderField:@"Range"];
-        [[job.session dataTaskWithRequest:req completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
-            NSHTTPURLResponse *http = (NSHTTPURLResponse *)response;
-            if (error || (http.statusCode != 200 && http.statusCode != 206) || data.length == 0) {
-                // Pass network errors through unchanged so a cancel keeps code -999.
-                finishFetch(error ?: YTHError(http.statusCode,
-                    [NSString stringWithFormat:@"YouTube refused the download (HTTP %ld).", (long)http.statusCode]));
-                return;
-            }
-            NSError *writeError = nil;
-            if (http.statusCode == 200) {
-                // The server ignored Range and sent the whole file. Whatever we wrote before is
-                // replaced so the output can't contain earlier chunks plus a full copy.
-                if (![handle truncateAtOffset:0 error:&writeError] || ![handle writeData:data error:&writeError]) {
-                    finishFetch(writeError ?: YTHError(4, @"Couldn't write the download to storage."));
-                    return;
-                }
-                offset = total = data.length;
-                finishFetch(nil);
-                return;
-            }
-            long long start = -1, rangeTotal = -1;
-            if (!YTHParseContentRange(http.allHeaderFields[@"Content-Range"], &start, &rangeTotal) || start != offset) {
-                finishFetch(YTHError(5, @"YouTube sent an unexpected part of the file. Try again."));
-                return;
-            }
-            if (![handle writeData:data error:&writeError]) {
-                finishFetch(writeError ?: YTHError(4, @"Couldn't write the download to storage."));
-                return;
-            }
-            offset += data.length;
-            if (rangeTotal > 0) total = rangeTotal;
-            if (total > 0)
-                [job setStatus:[NSString stringWithFormat:@"%@ %d%%", label, (int)(offset * 100 / total)]];
-            if (total > 0 && offset >= total) finishFetch(nil);
-            else if (total <= 0 && (long long)data.length < YTHChunkSize) finishFetch(nil); // unknown size, short read = end
-            else next();
-        }] resume];
-    };
-    next();
+    YTHRangeFetch *fetch = [YTHRangeFetch new];
+    fetch.job = self;
+    fetch.url = url;
+    fetch.handle = handle;
+    fetch.label = label;
+    fetch.done = done;
+    fetch.total = -1;
+    [fetch next];
 }
 
 @end
@@ -168,9 +250,10 @@ static NSString *YTHSafeFileName(NSString *title) {
     [[NSFileManager defaultManager] createDirectoryAtURL:job.workDir withIntermediateDirectories:YES attributes:nil error:nil];
 
     job.progressAlert = [UIAlertController alertControllerWithTitle:@"Downloading" message:@"Starting…" preferredStyle:UIAlertControllerStyleAlert];
+    __weak YTHDownloadJob *weakJob = job; // the alert is owned by the job
     [job.progressAlert addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:^(UIAlertAction *action) {
-        job.cancelled = YES;
-        [job.session invalidateAndCancel];
+        weakJob.cancelled = YES;
+        [weakJob.session invalidateAndCancel];
     }]];
     [presenter presentViewController:job.progressAlert animated:YES completion:nil];
 
