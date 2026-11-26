@@ -105,12 +105,13 @@ function cards(items) {
 }
 
 async function showSearch(q) {
+  const seq = routeSeq;
   $("#q").value = q;
   view.innerHTML = `<p class="empty">Searching…</p>`;
-  try {
-    const items = await api(`/api/search?q=${encodeURIComponent(q)}`);
-    view.innerHTML = cards(items);
-  } catch (err) { view.innerHTML = `<p class="empty">${esc(err.message)}</p>`; }
+  let html;
+  try { html = cards(await api(`/api/search?q=${encodeURIComponent(q)}`)); }
+  catch (err) { html = `<p class="empty">${esc(err.message)}</p>`; }
+  if (seq === routeSeq) view.innerHTML = html;
 }
 
 function showHome() {
@@ -133,49 +134,76 @@ const probe = document.createElement("video");
 const canPlay = (mime) =>
   (window.MediaSource?.isTypeSupported?.(mime) ?? false) || probe.canPlayType(mime) === "probably";
 
-function playableVideoFormats(info) {
-  // Keep the best playable format per (height, fps); prefer AV1 > VP9 > H.264 at equal size.
-  const rank = (c) => (/^av01/.test(c) ? 3 : /^vp0?9/.test(c) ? 2 : 1);
+// Build the quality list: DASH video-only formats (need a separate audio track) plus
+// progressive formats (audio+video in one file) as a fallback for heights DASH can't cover.
+function playableOptions(info) {
+  const rank = (c) => (/^av01/.test(c) ? 3 : /^vp0?9/.test(c) ? 2 : 1); // AV1 > VP9 > H.264
+  const audio = info.audioFormats.find((a) => canPlay(a.mime));
   const best = new Map();
-  for (const f of info.videoFormats) {
-    if (!canPlay(f.mime)) continue;
+  const consider = (f, muxed) => {
+    if (!canPlay(f.mime)) return;
     const key = `${f.height}p${f.fps > 30 ? f.fps : ""}`;
     const cur = best.get(key);
-    if (!cur || rank(f.vcodec) > rank(cur.vcodec)) best.set(key, f);
-  }
-  return [...best.values()].sort((a, b) => b.height - a.height || b.fps - a.fps);
+    // DASH (with a playable audio track) beats progressive at the same size; then codec rank
+    const score = (muxed ? 0 : 10) + rank(f.vcodec);
+    if (!cur || score > cur.score) best.set(key, { ...f, muxed, score, label: key });
+  };
+  if (audio) info.videoFormats.forEach((f) => consider(f, false));
+  (info.muxedFormats || []).forEach((f) => consider(f, true));
+  const options = [...best.values()].sort((a, b) => b.height - a.height || b.fps - a.fps);
+  return { options, audio };
 }
 
+let routeSeq = 0; // bumps on every navigation so slow responses can't overwrite a newer page
+
 async function showWatch(id) {
-  view.innerHTML = `<p class="empty">Loading…</p>`;
-  let info;
-  try { info = await api(`/api/video/${id}`); }
-  catch (err) { view.innerHTML = `<p class="empty">${esc(err.message)}</p>`; return; }
-  remember(info);
-
-  const formats = playableVideoFormats(info);
-  const audio = info.audioFormats.find((a) => canPlay(a.mime)) || info.audioFormats[0];
-  const start = formats.find((f) => f.height <= settings.maxHeight && f.fps <= settings.maxFps) || formats.at(-1);
-
+  const seq = routeSeq;
+  const stale = () => seq !== routeSeq;
   view.innerHTML = `
     <div class="player" id="player"></div>
-    <h2>${esc(info.title)}</h2>
-    <div class="toolbar">
-      <span class="meta">${esc(info.channel)} · ${fmtViews(info.views)}</span>
-      ${settings.adsEnabled ? `<span class="badge">Official player (ads on)</span>` : `
-        <select id="quality" aria-label="Quality">${formats.map((f) =>
-          `<option value="${f.id}" ${f === start ? "selected" : ""}>${f.height}p${f.fps > 30 ? f.fps : ""} · ${f.vcodec.split(".")[0]}</option>`).join("")}
-        </select><span class="badge">No ads</span>`}
-      <select id="dlQuality" aria-label="Download quality">
-        <option value="2160">Download 4K60</option>
-        <option value="1440">Download 1440p</option>
-        <option value="1080">Download 1080p</option>
-        <option value="720">Download 720p</option>
-        <option value="audio">Download audio only</option>
-      </select>
-      <button id="dlBtn">⬇ Download</button>
-    </div>
-    <div class="desc">${esc(info.description)}</div>`;
+    <h2 id="title"></h2>
+    <div class="toolbar" id="toolbar"><span class="meta">Loading…</span></div>
+    <div class="desc" id="desc" hidden></div>`;
+
+  // Official player doesn't depend on our extractor, so show it straight away.
+  if (settings.adsEnabled) {
+    $("#player").innerHTML = `<iframe src="https://www.youtube.com/embed/${id}?autoplay=1&playsinline=1"
+      allow="autoplay; encrypted-media; picture-in-picture; fullscreen" allowfullscreen></iframe>`;
+  }
+
+  let info;
+  try { info = await api(`/api/video/${id}`); }
+  catch (err) {
+    if (stale()) return;
+    $("#toolbar").innerHTML = `<span class="meta">Couldn't load details: ${esc(err.message)}</span>`;
+    if (!settings.adsEnabled) $("#player").innerHTML = `<p class="empty">Stream unavailable — turn on “Show ads” to use the official player.</p>`;
+    return;
+  }
+  if (stale()) return;
+  remember(info);
+
+  $("#title").textContent = info.title || "";
+  const desc = $("#desc");
+  desc.textContent = info.description || "";
+  desc.hidden = !info.description;
+
+  const { options, audio } = playableOptions(info);
+  const start = options.find((f) => f.height <= settings.maxHeight && f.fps <= settings.maxFps) || options.at(-1);
+
+  $("#toolbar").innerHTML = `
+    <span class="meta">${esc(info.channel)} · ${fmtViews(info.views)}</span>
+    ${settings.adsEnabled ? `<span class="badge">Official player (ads on)</span>` : `
+      <select id="quality" aria-label="Quality">${options.map((f, i) =>
+        `<option value="${i}" ${f === start ? "selected" : ""}>${f.label} · ${esc(f.vcodec.split(".")[0])}</option>`).join("")}
+      </select><span class="badge">No ads</span>`}
+    <select id="dlQuality" aria-label="Download quality">
+      <option value="2160">Download 4K60</option>
+      <option value="1440">Download 1440p</option>
+      <option value="1080">Download 1080p</option>
+      <option value="720">Download 720p</option>
+      <option value="audio">Download audio only</option>
+    </select>
+    <button id="dlBtn">⬇ Download</button>`;
 
   $("#dlBtn").onclick = () => {
     const q = $("#dlQuality").value;
@@ -185,50 +213,55 @@ async function showWatch(id) {
     document.body.append(a); a.click(); a.remove();
   };
 
-  if (settings.adsEnabled) {
-    $("#player").innerHTML = `<iframe src="https://www.youtube.com/embed/${id}?autoplay=1&playsinline=1"
-      allow="autoplay; encrypted-media; picture-in-picture; fullscreen" allowfullscreen></iframe>`;
+  if (settings.adsEnabled) return;
+  if (!start) {
+    $("#player").innerHTML = `<p class="empty">No stream this browser can play — try “Show ads” or download it.</p>`;
     return;
   }
-  if (!start || !audio) {
-    $("#player").innerHTML = `<p class="empty">No playable stream found</p>`;
-    return;
-  }
-  const player = mountSyncedPlayer($("#player"), id, start.id, audio.id);
-  $("#quality").onchange = (e) => player.switchVideo(e.target.value);
+  const player = mountPlayer($("#player"), id, start, audio);
+  $("#quality").onchange = (e) => player.switchTo(options[+e.target.value]);
 }
 
-// YouTube serves 1080p+ (and all 60fps above 720p) as separate video and audio
-// streams, so we play them in two elements and keep the audio locked to the video.
-function mountSyncedPlayer(host, id, videoFmt, audioFmt) {
-  const video = Object.assign(document.createElement("video"), {
-    controls: true, autoplay: true, playsInline: true, preload: "auto",
-    src: `/api/proxy/${id}/${videoFmt}`,
-  });
-  const audio = Object.assign(document.createElement("audio"), { preload: "auto", src: `/api/proxy/${id}/${audioFmt}` });
+// YouTube serves 1080p+ (and 60fps above 720p) as separate video and audio streams, so
+// DASH formats play in a <video> + <audio> pair with the audio locked to the video.
+// Progressive formats play in the <video> alone.
+function mountPlayer(host, id, fmt, audioFmt) {
+  const video = Object.assign(document.createElement("video"), { controls: true, autoplay: true, playsInline: true, preload: "auto" });
+  const audio = Object.assign(document.createElement("audio"), { preload: "auto" });
   host.replaceChildren(video, audio);
+  let separate = false;
 
-  const sync = () => { if (Math.abs(audio.currentTime - video.currentTime) > 0.25) audio.currentTime = video.currentTime; };
-  video.addEventListener("play", () => { sync(); audio.play().catch(() => {}); });
+  const sync = () => { if (separate && Math.abs(audio.currentTime - video.currentTime) > 0.25) audio.currentTime = video.currentTime; };
+  const playAudio = () => { if (separate) { sync(); audio.play().catch(() => {}); } };
+  video.addEventListener("play", playAudio);
+  video.addEventListener("playing", playAudio);
   video.addEventListener("pause", () => audio.pause());
   video.addEventListener("waiting", () => audio.pause());
-  video.addEventListener("playing", () => { sync(); audio.play().catch(() => {}); });
   video.addEventListener("seeked", sync);
   video.addEventListener("ratechange", () => { audio.playbackRate = video.playbackRate; });
   video.addEventListener("volumechange", () => { audio.volume = video.volume; audio.muted = video.muted; });
-  const timer = setInterval(() => { if (!video.isConnected) { clearInterval(timer); audio.pause(); audio.src = ""; } else if (!video.paused) sync(); }, 1000);
+  const timer = setInterval(() => {
+    if (!video.isConnected) { clearInterval(timer); video.pause(); audio.pause(); video.removeAttribute("src"); audio.removeAttribute("src"); }
+    else if (!video.paused) sync();
+  }, 1000);
 
-  return {
-    switchVideo(fmt) {
-      const t = video.currentTime, playing = !video.paused;
-      video.src = `/api/proxy/${id}/${fmt}`;
-      video.addEventListener("loadedmetadata", () => { video.currentTime = t; if (playing) video.play(); }, { once: true });
-    },
-  };
+  function load(f, resumeAt = 0, playing = true) {
+    separate = !f.muxed && !!audioFmt;
+    audio.pause();
+    if (separate) audio.src = `/api/proxy/${id}/${audioFmt.id}`; else audio.removeAttribute("src");
+    video.src = `/api/proxy/${id}/${f.id}`;
+    video.addEventListener("loadedmetadata", () => {
+      if (resumeAt) video.currentTime = resumeAt;
+      if (playing) video.play().catch(() => {});
+    }, { once: true });
+  }
+  load(fmt);
+  return { switchTo: (f) => load(f, video.currentTime, !video.paused) };
 }
 
 // ---------- router ----------
 function route() {
+  routeSeq++;
   const h = location.hash || "#/";
   if (h.startsWith("#/watch/")) return showWatch(h.slice(8));
   if (h.startsWith("#/search")) return showSearch(new URLSearchParams(h.split("?")[1]).get("q") || "");
