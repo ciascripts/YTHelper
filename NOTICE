@@ -1,12 +1,13 @@
 YTHelper IPA builder - third-party notices
 ==========================================
 
-tweak/Ads.x contains code adapted from YouTube-X by PoomSmart
+tweak/Ads.x and tweak/Background.x contain code adapted from YouTube-X by PoomSmart
 (https://github.com/PoomSmart/YouTube-X, commit 9a8e60a488325e37cf69e0611811889ab37cd3d3).
 tweak/Settings.x follows the settings-section pattern of YTUHD by PoomSmart.
 
 Built from source at pinned commits by .github/workflows/build-ipa.yml (not stored in this repo):
-- YTUHD, YTVideoOverlay, YouGroupSettings, YouTubeHeader by PoomSmart: MIT License (below).
+- YTUHD, YTVideoOverlay, YouGroupSettings, IAmYouTube, YouTubeHeader by PoomSmart: MIT License (below).
+- YouPiP by SpicaT and PoomSmart: MIT License (Copyright (c) 2018 - 2020 SpicaT), same terms as below.
 - PSHeader by PoomSmart: no license file in the repository. It is only downloaded as build-time
   headers and is not stored in this repository.
 - Theos (https://github.com/theos/theos): GPL-3.0, build tool only.

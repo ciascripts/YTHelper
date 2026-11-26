@@ -30,6 +30,13 @@ static UIImage *YTHDownloadIcon(void) {
     return [[UIImage systemImageNamed:@"arrow.down.circle" withConfiguration:cfg] imageWithRenderingMode:UIImageRenderingModeAlwaysTemplate];
 }
 
+// Accepts an NSURL or a URL string; anything else (or an empty string) gives nil.
+static NSURL *YTHAsURL(id value) {
+    if ([value isKindOfClass:NSURL.class]) return value;
+    if ([value isKindOfClass:NSString.class] && [value length]) return [NSURL URLWithString:value];
+    return nil;
+}
+
 static int YTHIntValue(id obj, NSString *key) {
     @try { return [[obj valueForKey:key] intValue]; } @catch (NSException *e) { return 0; }
 }
@@ -42,17 +49,17 @@ static NSArray<YTHStream *> *YTHCollectStreams(YTPlayerViewController *player, N
         if (![f respondsToSelector:@selector(itag)] || ![f respondsToSelector:@selector(URL)]) return;
         YTHStream *s = [YTHStream new];
         s.itag = [f itag];
-        s.URL = [f URL];
+        s.URL = YTHAsURL([f URL]); // some versions return a string here
         if (s.URL) [streams addObject:s];
     };
     void (^addFormatStream)(id) = ^(id fs) {
-        NSString *url = nil;
+        id url = nil;
         @try { url = [fs valueForKey:@"URL"]; } @catch (NSException *e) {}
         int itag = YTHIntValue(fs, @"itag");
-        if (url.length && itag) {
+        if (YTHAsURL(url) && itag) {
             YTHStream *s = [YTHStream new];
             s.itag = itag;
-            s.URL = [NSURL URLWithString:url];
+            s.URL = YTHAsURL(url);
             [streams addObject:s];
         }
     };
@@ -81,14 +88,36 @@ static NSArray<YTHStream *> *YTHCollectStreams(YTPlayerViewController *player, N
     return streams;
 }
 
+static void YTHShowError(NSString *message) {
+    UIAlertController *a = [UIAlertController alertControllerWithTitle:@"Download error" message:message preferredStyle:UIAlertControllerStyleAlert];
+    [a addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
+    [YTHTopViewController() presentViewController:a animated:YES completion:nil];
+}
+
 static void YTHStartDownload(YTPlayerViewController *player) {
-    if (!player) return;
-    if ([YTHDownloader isBusy]) return;
-    if ([player respondsToSelector:@selector(isPlayingAd)] && player.isPlayingAd) return;
-    NSString *title = nil;
-    NSArray *streams = YTHCollectStreams(player, &title);
-    UIViewController *presenter = YTHTopViewController() ?: player;
-    [YTHDownloader downloadTitle:title ?: @"video" streams:streams maxHeight:YTHDownloadQuality() presenter:presenter];
+    // Any Objective-C exception here (e.g. a method YouTube renamed) becomes an error message
+    // with the reason, instead of crashing the app.
+    @try {
+        if (!player) { YTHShowError(@"Couldn't find the video player. Start playing the video and try again."); return; }
+        if ([YTHDownloader isBusy]) return;
+        if ([player respondsToSelector:@selector(isPlayingAd)] && player.isPlayingAd) return;
+        NSString *title = nil;
+        NSArray *streams = YTHCollectStreams(player, &title);
+        UIViewController *presenter = YTHTopViewController() ?: player;
+        [YTHDownloader downloadTitle:title ?: @"video" streams:streams maxHeight:YTHDownloadQuality() presenter:presenter];
+    } @catch (NSException *e) {
+        YTHShowError([NSString stringWithFormat:@"%@: %@\n\nPlease send this message to the YTHelper developer.", e.name, e.reason]);
+    }
+}
+
+// The player controller, without assuming the property still exists in this YouTube version.
+static YTPlayerViewController *YTHPlayerFromOverlay(id overlay) {
+    id player = nil;
+    if ([overlay respondsToSelector:@selector(playerViewController)]) {
+        @try { player = [overlay playerViewController]; } @catch (NSException *e) {}
+    }
+    if (![player isKindOfClass:%c(YTPlayerViewController)]) player = nil;
+    return player ?: gPlayerVC;
 }
 
 %group Top
@@ -96,7 +125,7 @@ static void YTHStartDownload(YTPlayerViewController *player) {
 
 - (void)setPlayerViewController:(YTPlayerViewController *)vc {
     %orig;
-    if (vc) gPlayerVC = vc;
+    if ([vc isKindOfClass:%c(YTPlayerViewController)]) gPlayerVC = vc;
 }
 
 - (UIImage *)buttonImage:(NSString *)tweakId {
@@ -105,7 +134,7 @@ static void YTHStartDownload(YTPlayerViewController *player) {
 
 %new(v@:@)
 - (void)didPressYTHelperDownload:(id)arg {
-    YTHStartDownload(self.playerViewController ?: gPlayerVC);
+    YTHStartDownload(YTHPlayerFromOverlay(self));
 }
 
 %end

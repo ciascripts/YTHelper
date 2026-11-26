@@ -77,9 +77,21 @@ static void YTHAlert(NSString *title, NSString *message) {
     [YTHTopViewController() presentViewController:a animated:YES completion:nil];
 }
 
+// IAmYouTube (needed for Google sign-in when sideloaded) makes NSBundle report YouTube's own
+// name and ID, so read our real values straight from the Info.plist file on disk.
+static NSDictionary *YTHRealInfoPlist(void) {
+    static NSDictionary *info;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        NSURL *url = [NSBundle.mainBundle.bundleURL URLByAppendingPathComponent:@"Info.plist"];
+        info = [NSDictionary dictionaryWithContentsOfURL:url] ?: @{};
+    });
+    return info;
+}
+
 // Alternate Home Screen icons that the build workflow added to Info.plist.
 static NSArray<NSString *> *YTHAlternateIconNames(void) {
-    NSDictionary *icons = [NSBundle.mainBundle objectForInfoDictionaryKey:@"CFBundleIcons"];
+    NSDictionary *icons = YTHRealInfoPlist()[@"CFBundleIcons"];
     NSDictionary *alts = icons[@"CFBundleAlternateIcons"];
     return [alts.allKeys sortedArrayUsingSelector:@selector(localizedStandardCompare:)] ?: @[];
 }
@@ -130,6 +142,17 @@ static NSString *YTHQualityLabel(NSInteger q) {
         switchOn:YTHBlockAds()
         switchBlock:^BOOL (YTSettingsCell *cell, BOOL enabled) {
             [YTHDefaults() setBool:enabled forKey:YTHBlockAdsKey];
+            return YES;
+        }
+        settingItemId:0]];
+
+    // Background play
+    [items addObject:[Item switchItemWithTitle:@"Background play"
+        titleDescription:@"Keeps videos playing when you lock the screen or switch apps. Restart the app after changing."
+        accessibilityIdentifier:nil
+        switchOn:YTHBackgroundPlay()
+        switchBlock:^BOOL (YTSettingsCell *cell, BOOL enabled) {
+            [YTHDefaults() setBool:enabled forKey:YTHBackgroundPlayKey];
             return YES;
         }
         settingItemId:0]];
@@ -197,7 +220,7 @@ static NSString *YTHQualityLabel(NSInteger q) {
 
     // Home Screen icon (alternate icons bundled at build time)
     NSArray<NSString *> *altIcons = YTHAlternateIconNames();
-    NSString *homeName = [NSBundle.mainBundle objectForInfoDictionaryKey:@"CFBundleDisplayName"] ?: @"YouTube";
+    NSString *homeName = YTHRealInfoPlist()[@"CFBundleDisplayName"] ?: @"YouTube";
     [items addObject:[Item itemWithTitle:@"Home Screen icon"
         titleDescription:[NSString stringWithFormat:@"Home Screen name: %@ (set when building the IPA).%@", homeName,
             altIcons.count ? @"" : @"\nNo extra icons in this build. Add some with alt_icon_urls when you build the IPA."]

@@ -48,6 +48,8 @@ env:
   YTVIDEOOVERLAY_SHA: f5bfd3f0cc7b3d18ea45e505da6c3120a26b89d2 # PoomSmart/YTVideoOverlay (MIT)
   YOUGROUPSETTINGS_SHA: 4697fb3e277303e0d611362982d9ddaea0424485 # PoomSmart/YouGroupSettings (MIT)
   YTUHD_SHA: bbd8e867c2d4c47458832d92c7a4580f63b5ac9d           # PoomSmart/YTUHD v2.7.1 (MIT)
+  IAMYOUTUBE_SHA: 053be50b2b43403097a02059a83f6ae305468874      # PoomSmart/IAmYouTube v1.4.0 (MIT)
+  YOUPIP_SHA: 034477a48c8ec18736e26d054106df88c1f0deb3          # PoomSmart/YouPiP v1.12.15 (MIT)
   CYAN_SHA: 740d3716dcd98c20c000f12cdb88f1f0b2a533a4            # asdfzxcvbn/pyzule-rw
 
 jobs:
@@ -81,6 +83,9 @@ jobs:
           mkdir -p deps
           clone_at https://github.com/PoomSmart/YTVideoOverlay deps/YTVideoOverlay "$YTVIDEOOVERLAY_SHA"
           clone_at https://github.com/PoomSmart/YouGroupSettings deps/YouGroupSettings "$YOUGROUPSETTINGS_SHA"
+          clone_at https://github.com/PoomSmart/IAmYouTube deps/IAmYouTube "$IAMYOUTUBE_SHA"
+          # YouPiP imports ../YTVideoOverlay, so it must sit next to it in deps/.
+          clone_at https://github.com/PoomSmart/YouPiP deps/YouPiP "$YOUPIP_SHA"
           if [ "${{ inputs.include_4k }}" = "true" ]; then
             clone_at https://github.com/PoomSmart/YTUHD deps/YTUHD "$YTUHD_SHA"
             git -C deps/YTUHD submodule update -q --init --depth 1
@@ -104,6 +109,11 @@ jobs:
           }
           build deps/YTVideoOverlay
           build deps/YouGroupSettings
+          # Makes the re-signed app look like the real YouTube to Google sign-in and fixes
+          # its keychain access group; without it sign-in says Google "can't confirm it's safe".
+          build deps/IAmYouTube
+          # Picture-in-picture (adds a PiP button to the player via YTVideoOverlay).
+          build deps/YouPiP
           if [ -d deps/YTUHD ]; then build deps/YTUHD SIDELOAD=1; fi
           build tweak DEPS_DIR="$GITHUB_WORKSPACE/deps"
           ls -l debs
@@ -122,7 +132,7 @@ jobs:
             exit 1
           fi
           if ! unzip -l youtube.ipa | grep -q 'Payload/YouTube.app/Info.plist'; then
-            echo "::error::This file is not a YouTube IPA (no Payload/YouTube.app). Check the link is a direct download."
+            echo "::error::This file is not a YouTube IPA (no Payload/YouTube.app). Use the archive.org /download/…/….ipa link, not the /details/ page."
             exit 1
           fi
 
