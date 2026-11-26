@@ -86,6 +86,15 @@ jobs:
             git -C deps/YTUHD submodule update -q --init --depth 1
           fi
 
+      - name: Build YTUHD video decoders (libvpx, dav1d)
+        if: ${{ inputs.include_4k }}
+        run: |
+          # YTUHD's Makefile is meant to build these on demand, but that rule doesn't fire
+          # with this Theos, so build them explicitly with YTUHD's own scripts.
+          bash deps/YTUHD/vendor/build_libvpx.sh
+          bash deps/YTUHD/vendor/build_dav1d.sh
+          ls -l deps/YTUHD/vendor/libvpx_ios/libvpx.a deps/YTUHD/vendor/dav1d_ios/libdav1d.a
+
       - name: Build tweaks
         run: |
           mkdir -p debs
