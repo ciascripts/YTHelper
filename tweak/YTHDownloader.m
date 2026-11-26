@@ -64,6 +64,19 @@ static BOOL YTHParseContentRange(NSString *header, long long *start, long long *
     return YES;
 }
 
+// Strictly parses the 416 form "bytes */TOTAL".
+static BOOL YTHParseUnsatisfiedRange(NSString *header, long long *total) {
+    const char *h = header.UTF8String;
+    if (!h || strncmp(h, "bytes */", 8) != 0) return NO;
+    const char *p = h + 8;
+    long long t;
+    if (!YTHReadNumber(&p, &t)) return NO;
+    while (*p == ' ' || *p == '\t') p++;
+    if (*p != '\0') return NO;
+    *total = t;
+    return YES;
+}
+
 // Downloads one URL to one file in 10 MB ranges. Each request's completion handler
 // keeps this object alive until the next request starts, so no block refers to itself.
 @interface YTHRangeFetch : NSObject
@@ -97,6 +110,18 @@ static BOOL YTHParseContentRange(NSString *header, long long *start, long long *
 }
 
 - (void)handleData:(NSData *)data response:(NSHTTPURLResponse *)http error:(NSError *)error {
+    if (!error && http.statusCode == 416) {
+        // "Range not satisfiable": only a success if it confirms the file ends exactly here.
+        long long confirmed = -1;
+        if (YTHParseUnsatisfiedRange([http valueForHTTPHeaderField:@"Content-Range"], &confirmed) &&
+            confirmed == self.offset && (self.total < 0 || self.total == confirmed)) {
+            self.total = confirmed;
+            [self finishWithError:nil];
+        } else {
+            [self finishWithError:YTHError(5, @"YouTube sent an unexpected part of the file. Try again.")];
+        }
+        return;
+    }
     if (error || (http.statusCode != 200 && http.statusCode != 206) || data.length == 0) {
         // Pass network errors through unchanged so a cancel keeps code -999.
         [self finishWithError:error ?: YTHError(http.statusCode,
@@ -121,7 +146,8 @@ static BOOL YTHParseContentRange(NSString *header, long long *start, long long *
     if (!YTHParseContentRange([http valueForHTTPHeaderField:@"Content-Range"], &start, &end, &rangeTotal) ||
         start != self.offset ||
         (long long)data.length != end - start + 1 ||
-        (self.total >= 0 && rangeTotal >= 0 && rangeTotal != self.total)) {
+        (self.total >= 0 && rangeTotal >= 0 && rangeTotal != self.total) ||
+        (self.total >= 0 && end >= self.total)) {
         [self finishWithError:YTHError(5, @"YouTube sent an unexpected part of the file. Try again.")];
         return;
     }
@@ -133,8 +159,10 @@ static BOOL YTHParseContentRange(NSString *header, long long *start, long long *
     if (rangeTotal >= 0) self.total = rangeTotal;
     if (self.total > 0)
         [self.job setStatus:[NSString stringWithFormat:@"%@ %d%%", self.label, (int)(self.offset * 100 / self.total)]];
+    // Finished only when a known total is reached. With an unknown ("*") total, or when the
+    // server caps responses below our chunk size, keep asking from the next offset; the end
+    // is then confirmed by a total in a later response or by a 416 "bytes */N" at N.
     if (self.total >= 0 && self.offset >= self.total) [self finishWithError:nil];
-    else if (self.total < 0 && (long long)data.length < YTHChunkSize) [self finishWithError:nil]; // size "*": short read = end
     else [self next];
 }
 
