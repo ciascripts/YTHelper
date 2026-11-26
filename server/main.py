@@ -239,7 +239,7 @@ def mime_of(f: dict) -> str:
 @app.get("/api/video/{vid}")
 def video(vid: str):
     info = get_info(check_id(vid))
-    videos, audios = [], []
+    videos, audios, muxed = [], [], []
     for f in info.get("formats") or []:
         if f.get("protocol") not in ("https", "http") or not f.get("url"):
             continue
@@ -250,7 +250,11 @@ def video(vid: str):
             videos.append({**entry, "height": f.get("height") or 0, "fps": f.get("fps") or 30, "vcodec": f.get("vcodec")})
         elif has_a and not has_v:
             audios.append({**entry, "acodec": f.get("acodec"), "abr": f.get("abr") or 0})
-    videos.sort(key=lambda f: (f["height"], f["fps"], f["tbr"]), reverse=True)
+        elif has_v and has_a:
+            # progressive (audio+video in one file): fallback when DASH isn't playable/available
+            muxed.append({**entry, "height": f.get("height") or 0, "fps": f.get("fps") or 30, "vcodec": f.get("vcodec")})
+    for lst in (videos, muxed):
+        lst.sort(key=lambda f: (f["height"], f["fps"], f["tbr"]), reverse=True)
     audios.sort(key=lambda f: f["abr"], reverse=True)
     return {
         "id": vid,
@@ -262,6 +266,7 @@ def video(vid: str):
         "thumb": info.get("thumbnail"),
         "videoFormats": videos,
         "audioFormats": audios,
+        "muxedFormats": muxed,
     }
 
 
