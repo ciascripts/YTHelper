@@ -9,12 +9,15 @@ link for each build.
 | Feature | Where |
 |---|---|
 | **Block ads** (video, feed, Shorts, shopping) | YouTube Settings → YTHelper. Restart the app after changing. |
+| **Background play**: keeps playing with the screen off or in another app | YouTube Settings → YTHelper. Restart the app after changing. |
+| **Picture-in-picture** (YouPiP) | PiP button on the video player; options in YouTube Settings |
 | **In-app name**: shown instead of the YouTube logo | YouTube Settings → YTHelper |
 | **In-app logo**: a picture from Photos instead of the YouTube logo | YouTube Settings → YTHelper |
 | **Home Screen name** | Set when you build (`display_name`) |
 | **Home Screen icon** | Set when you build (`icon_url`). Extra icons (`alt_icon_urls`) can be switched in YouTube Settings → YTHelper. |
 | **Download videos** (H.264 + AAC MP4, up to 1080p60, or audio only) | Download button on the video player. Quality is set in YouTube Settings → YTHelper. |
 | **4K / 60 fps** | YTUHD, in YouTube Settings → Video quality preferences |
+| **Google sign-in** in the sideloaded app | IAmYouTube, built in automatically |
 
 ## Build the IPA
 
@@ -22,6 +25,7 @@ link for each build.
 2. Go to **Actions → Build YTHelper IPA → Run workflow** and fill in:
    - `ipa_url`: a direct download link to a decrypted YouTube IPA, for example
      `https://archive.org/download/com.google.ios.youtube_21.41.5_und3fined/com.google.ios.youtube_21.41.5_und3fined.ipa`
+     (use the `/download/…/….ipa` link, not the `/details/` page).
    - `ipa_sha256` (optional): the file's SHA-256, so a changed download is rejected.
      Every run prints the SHA-256 of the file it downloaded.
    - `display_name`: the name under the Home Screen icon.
@@ -39,12 +43,15 @@ free Apple ID must be refreshed every 7 days.
 
 ## Things to know
 
+- **Your YouTube account stays a normal account.** YTHelper adds features in the app; it doesn't
+  unlock or fake a YouTube Premium subscription.
 - **Home Screen name and icon** are part of the app bundle. To change them, build again.
   The alternate icons from `alt_icon_urls` can be switched any time; iOS shows a short notice when you do.
 - **Downloads** use the stream links the YouTube app already has. If YouTube sends a video in its newer
   streaming format (SABR), there are no links and the downloader says it can't download that video.
+  If anything else goes wrong it shows a "Download error" with the reason instead of closing the app.
 - **4K on sideloaded apps** usually uses software VP9/AV1 decoding, which uses more battery.
-- **Hooks are tied to YouTube versions.** Written for YouTube 21.41.5 and not yet tested on a device. A newer YouTube may
+- **Hooks are tied to YouTube versions.** Written for YouTube 21.41.5. A newer YouTube may
   need updated pinned commits in the workflow.
 
 ## Layout
