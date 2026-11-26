@@ -23,7 +23,7 @@
 - (void)didPressYTHelperDownload:(id)arg;
 @end
 
-static __weak YTPlayerViewController *gPlayerVC; // most recent player, used by the bottom-bar button
+static __weak YTPlayerViewController *gPlayerVC; // most recent player, used as a fallback
 
 static UIImage *YTHDownloadIcon(void) {
     UIImageSymbolConfiguration *cfg = [UIImageSymbolConfiguration configurationWithPointSize:OVERLAY_BUTTON_SIZE weight:UIImageSymbolWeightMedium];
@@ -94,30 +94,61 @@ static void YTHShowError(NSString *message) {
     [YTHTopViewController() presentViewController:a animated:YES completion:nil];
 }
 
-static void YTHStartDownload(YTPlayerViewController *player) {
+// Anything that can hand us the current video counts as "the player"; this avoids depending on
+// class or property names that YouTube changes between versions.
+static BOOL YTHLooksLikePlayer(id obj) {
+    return obj && [obj respondsToSelector:@selector(activeVideo)];
+}
+
+// Class names from the button up to the window, shown when no player is found so the
+// next fix can target the right object.
+static NSString *YTHResponderChain(id start) {
+    NSMutableArray *names = [NSMutableArray array];
+    if ([start isKindOfClass:UIResponder.class])
+        for (UIResponder *r = start; r && names.count < 25; r = r.nextResponder)
+            [names addObject:NSStringFromClass(r.class)];
+    return [names componentsJoinedByString:@" > "];
+}
+
+static void YTHStartDownload(YTPlayerViewController *player, id sender) {
     // Any Objective-C exception here (e.g. a method YouTube renamed) becomes an error message
     // with the reason, instead of crashing the app.
     @try {
-        if (!player) { YTHShowError(@"Couldn't find the video player. Start playing the video and try again."); return; }
+        if (!player) {
+            YTHShowError([NSString stringWithFormat:@"Couldn't find the video player. Start playing the video and try again.\n\nDetails for the developer: %@", YTHResponderChain(sender)]);
+            return;
+        }
         if ([YTHDownloader isBusy]) return;
         if ([player respondsToSelector:@selector(isPlayingAd)] && player.isPlayingAd) return;
         NSString *title = nil;
         NSArray *streams = YTHCollectStreams(player, &title);
-        UIViewController *presenter = YTHTopViewController() ?: player;
+        UIViewController *presenter = YTHTopViewController() ?: (UIViewController *)player;
         [YTHDownloader downloadTitle:title ?: @"video" streams:streams maxHeight:YTHDownloadQuality() presenter:presenter];
     } @catch (NSException *e) {
         YTHShowError([NSString stringWithFormat:@"%@: %@\n\nPlease send this message to the YTHelper developer.", e.name, e.reason]);
     }
 }
 
-// The player controller, without assuming the property still exists in this YouTube version.
+// Finds the player that owns this button:
+// 1. the overlay's playerViewController property, if this YouTube version still has it;
+// 2. walking up the responder chain (button -> views -> view controllers and their parents);
+// 3. the last player that appeared on screen.
 static YTPlayerViewController *YTHPlayerFromOverlay(id overlay) {
     id player = nil;
     if ([overlay respondsToSelector:@selector(playerViewController)]) {
         @try { player = [overlay playerViewController]; } @catch (NSException *e) {}
     }
-    if (![player isKindOfClass:%c(YTPlayerViewController)]) player = nil;
-    return player ?: gPlayerVC;
+    if (!YTHLooksLikePlayer(player)) player = nil;
+    if (!player && [overlay isKindOfClass:UIResponder.class]) {
+        for (UIResponder *r = overlay; r && !player; r = r.nextResponder) {
+            if (YTHLooksLikePlayer(r)) { player = r; break; }
+            if ([r isKindOfClass:UIViewController.class])
+                for (UIViewController *vc = ((UIViewController *)r).parentViewController; vc; vc = vc.parentViewController)
+                    if (YTHLooksLikePlayer(vc)) { player = vc; break; }
+        }
+    }
+    if (!player && YTHLooksLikePlayer(gPlayerVC)) player = gPlayerVC;
+    return player;
 }
 
 %group Top
@@ -125,7 +156,7 @@ static YTPlayerViewController *YTHPlayerFromOverlay(id overlay) {
 
 - (void)setPlayerViewController:(YTPlayerViewController *)vc {
     %orig;
-    if ([vc isKindOfClass:%c(YTPlayerViewController)]) gPlayerVC = vc;
+    if (YTHLooksLikePlayer(vc)) gPlayerVC = vc;
 }
 
 - (UIImage *)buttonImage:(NSString *)tweakId {
@@ -134,7 +165,7 @@ static YTPlayerViewController *YTHPlayerFromOverlay(id overlay) {
 
 %new(v@:@)
 - (void)didPressYTHelperDownload:(id)arg {
-    YTHStartDownload(YTHPlayerFromOverlay(self));
+    YTHStartDownload(YTHPlayerFromOverlay(self), self);
 }
 
 %end
@@ -149,9 +180,19 @@ static YTPlayerViewController *YTHPlayerFromOverlay(id overlay) {
 
 %new(v@:@)
 - (void)didPressYTHelperDownload:(id)arg {
-    YTHStartDownload(gPlayerVC);
+    YTHStartDownload(YTHPlayerFromOverlay(self), self);
 }
 
+%end
+%end
+
+// Remember the player whenever one appears, as a last-resort fallback.
+%group TrackPlayer
+%hook YTPlayerViewController
+- (void)viewDidAppear:(BOOL)animated {
+    %orig;
+    if (YTHLooksLikePlayer(self)) gPlayerVC = self;
+}
 %end
 %end
 
@@ -164,4 +205,5 @@ static YTPlayerViewController *YTHPlayerFromOverlay(id overlay) {
     });
     %init(Top);
     %init(Bottom);
+    if (%c(YTPlayerViewController)) %init(TrackPlayer);
 }
