@@ -45,6 +45,46 @@ def write_icon_set(src: Path, app: Path, base: str) -> tuple[list[str], list[str
     return iphone, iphone + ipad
 
 
+NAME_KEYS = ("CFBundleDisplayName", "CFBundleName")
+
+
+def _strings_escape(value: str) -> str:
+    return value.replace("\\", "\\\\").replace('"', '\\"')
+
+
+def patch_localized_names(app: Path, name: str) -> int:
+    """Localized InfoPlist.strings override Info.plist, so set the name there too.
+
+    Handles binary/XML plists and text .strings files (UTF-8 or UTF-16).
+    Returns how many files were changed.
+    """
+    changed = 0
+    for strings in sorted(app.glob("*.lproj/InfoPlist.strings")):
+        raw = strings.read_bytes()
+        if raw.startswith(b"bplist") or raw.lstrip().startswith(b"<?xml"):
+            data = plistlib.loads(raw)
+            if not any(k in data for k in NAME_KEYS):
+                continue
+            for k in NAME_KEYS:
+                if k in data:
+                    data[k] = name if k == "CFBundleDisplayName" else name[:15]
+            fmt = plistlib.FMT_BINARY if raw.startswith(b"bplist") else plistlib.FMT_XML
+            strings.write_bytes(plistlib.dumps(data, fmt=fmt))
+            changed += 1
+            continue
+        encoding = "utf-16" if raw[:2] in (b"\xff\xfe", b"\xfe\xff") else "utf-8"
+        text = raw.decode(encoding)
+        new_text = text
+        for k in NAME_KEYS:
+            value = _strings_escape(name if k == "CFBundleDisplayName" else name[:15])
+            pattern = re.compile(r'("?' + k + r'"?\s*=\s*)"(?:[^"\\]|\\.)*"(\s*;)')
+            new_text = pattern.sub(lambda m: f'{m.group(1)}"{value}"{m.group(2)}', new_text)
+        if new_text != text:
+            strings.write_bytes(new_text.encode(encoding))
+            changed += 1
+    return changed
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("app", type=Path)
@@ -93,6 +133,8 @@ def main() -> int:
 
     with open(plist_path, "wb") as f:
         plistlib.dump(info, f, fmt=plistlib.FMT_BINARY)
+    localized = patch_localized_names(args.app, name)
+    print(f"Updated localized names in {localized} .lproj folder(s)")
     print(f"Patched {plist_path}: name={name!r}, icon={'custom' if args.icon else 'original'}, alt icons={list(alts)}")
     return 0
 
