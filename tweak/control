@@ -1,0 +1,9 @@
+Package: com.ciascripts.ythelper
+Name: YTHelper
+Version: 0.1.0
+Architecture: iphoneos-arm
+Description: Custom name and logo, ad blocking and downloads for YouTube.
+Maintainer: ciascripts
+Author: ciascripts
+Section: Tweaks
+Depends: mobilesubstrate (>= 0.9.5000), firmware (>= 15.0), com.ps.ytvideooverlay (>= 2.0.0)
