@@ -146,6 +146,17 @@ static NSString *YTHQualityLabel(NSInteger q) {
         }
         settingItemId:0]];
 
+    // Background play
+    [items addObject:[Item switchItemWithTitle:@"Background play"
+        titleDescription:@"Keeps videos playing when you lock the screen or switch apps. Restart the app after changing."
+        accessibilityIdentifier:nil
+        switchOn:YTHBackgroundPlay()
+        switchBlock:^BOOL (YTSettingsCell *cell, BOOL enabled) {
+            [YTHDefaults() setBool:enabled forKey:YTHBackgroundPlayKey];
+            return YES;
+        }
+        settingItemId:0]];
+
     // In-app name
     [items addObject:[Item itemWithTitle:@"In-app name"
         titleDescription:@"Replaces the YouTube logo in the top bar with this text. Leave empty to keep the logo."
