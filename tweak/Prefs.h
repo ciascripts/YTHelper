@@ -2,6 +2,7 @@
 #import <UIKit/UIKit.h>
 
 #define YTHBlockAdsKey        @"YTHelper-BlockAds"
+#define YTHBackgroundPlayKey  @"YTHelper-BackgroundPlay"
 #define YTHInAppNameKey       @"YTHelper-InAppName"
 #define YTHUseCustomLogoKey   @"YTHelper-UseCustomLogo"
 #define YTHDownloadQualityKey @"YTHelper-DownloadQuality"
@@ -14,6 +15,12 @@ static inline NSUserDefaults *YTHDefaults(void) { return [NSUserDefaults standar
 // Ads are blocked unless the user turned it off. Read at launch, so changes need a restart.
 static inline BOOL YTHBlockAds(void) {
     id v = [YTHDefaults() objectForKey:YTHBlockAdsKey];
+    return v ? [v boolValue] : YES;
+}
+
+// Background play is on unless the user turned it off. Read at launch, so changes need a restart.
+static inline BOOL YTHBackgroundPlay(void) {
+    id v = [YTHDefaults() objectForKey:YTHBackgroundPlayKey];
     return v ? [v boolValue] : YES;
 }
 
