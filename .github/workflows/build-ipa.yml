@@ -1,0 +1,175 @@
+name: Build YTHelper IPA
+
+on:
+  workflow_dispatch:
+    inputs:
+      ipa_url:
+        description: "Direct download link to a decrypted YouTube .ipa"
+        required: true
+      ipa_sha256:
+        description: "SHA-256 of that .ipa (optional, recommended)"
+        required: false
+        default: ""
+      display_name:
+        description: "Home Screen name"
+        required: true
+        default: "YTHelper"
+      icon_url:
+        description: "Home Screen icon: direct link to a square PNG/JPG (optional)"
+        required: false
+        default: ""
+      alt_icon_urls:
+        description: "Extra icons to pick inside the app, as Name=URL separated by commas (optional)"
+        required: false
+        default: ""
+      bundle_id:
+        description: "Bundle ID (optional; empty keeps YouTube's)"
+        required: false
+        default: ""
+      include_4k:
+        description: "Include YTUHD (4K / 60 fps)"
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-ipa
+  cancel-in-progress: true
+
+env:
+  THEOS: ${{ github.workspace }}/theos
+  # Pinned dependency commits. Update these deliberately and note it in the PR.
+  THEOS_REPO: https://github.com/theos/theos
+  THEOS_SHA: 9bc73406cf80b711ef4d02c15ff1dedc4478a275
+  YOUTUBEHEADER_SHA: 1e6aa2cf7c6840e3c66e0ab42844f0f4ae800795 # PoomSmart/YouTubeHeader (MIT)
+  PSHEADER_SHA: e550353cee1bda80884e38b31204133a7048118d      # PoomSmart/PSHeader
+  YTVIDEOOVERLAY_SHA: f5bfd3f0cc7b3d18ea45e505da6c3120a26b89d2 # PoomSmart/YTVideoOverlay (MIT)
+  YOUGROUPSETTINGS_SHA: 4697fb3e277303e0d611362982d9ddaea0424485 # PoomSmart/YouGroupSettings (MIT)
+  YTUHD_SHA: bbd8e867c2d4c47458832d92c7a4580f63b5ac9d           # PoomSmart/YTUHD v2.7.1 (MIT)
+  CYAN_SHA: 740d3716dcd98c20c000f12cdb88f1f0b2a533a4            # asdfzxcvbn/pyzule-rw
+
+jobs:
+  build:
+    name: Build IPA
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - name: Check out YTHelper
+        uses: actions/checkout@v4
+
+      - name: Install tools
+        run: |
+          brew install ldid make dpkg meson ninja
+          python3 -m venv "$RUNNER_TEMP/venv"
+          "$RUNNER_TEMP/venv/bin/pip" install --quiet pillow "git+https://github.com/asdfzxcvbn/pyzule-rw.git@$CYAN_SHA"
+          echo "$RUNNER_TEMP/venv/bin" >> "$GITHUB_PATH"
+
+      - name: Fetch Theos and pinned dependencies
+        run: |
+          clone_at() { # repo dir sha
+            git init -q "$2"
+            git -C "$2" remote add origin "$1"
+            git -C "$2" fetch -q --depth 1 origin "$3"
+            git -C "$2" checkout -q FETCH_HEAD
+          }
+          clone_at "$THEOS_REPO" "$THEOS" "$THEOS_SHA"
+          git -C "$THEOS" submodule update -q --init --recursive --depth 1
+          clone_at https://github.com/PoomSmart/YouTubeHeader "$THEOS/include/YouTubeHeader" "$YOUTUBEHEADER_SHA"
+          clone_at https://github.com/PoomSmart/PSHeader "$THEOS/include/PSHeader" "$PSHEADER_SHA"
+          mkdir -p deps
+          clone_at https://github.com/PoomSmart/YTVideoOverlay deps/YTVideoOverlay "$YTVIDEOOVERLAY_SHA"
+          clone_at https://github.com/PoomSmart/YouGroupSettings deps/YouGroupSettings "$YOUGROUPSETTINGS_SHA"
+          if [ "${{ inputs.include_4k }}" = "true" ]; then
+            clone_at https://github.com/PoomSmart/YTUHD deps/YTUHD "$YTUHD_SHA"
+            git -C deps/YTUHD submodule update -q --init --depth 1
+          fi
+
+      - name: Build tweaks
+        run: |
+          mkdir -p debs
+          build() { # dir [extra make args]
+            (cd "$1" && gmake clean package DEBUG=0 FINALPACKAGE=1 "${@:2}")
+            mv "$1"/packages/*.deb debs/
+          }
+          build deps/YTVideoOverlay
+          build deps/YouGroupSettings
+          if [ -d deps/YTUHD ]; then build deps/YTUHD SIDELOAD=1; fi
+          build tweak DEPS_DIR="$GITHUB_WORKSPACE/deps"
+          ls -l debs
+
+      - name: Download and check the IPA
+        env:
+          IPA_URL: ${{ inputs.ipa_url }}
+          IPA_SHA256: ${{ inputs.ipa_sha256 }}
+        run: |
+          curl -fL --retry 3 --retry-delay 5 -o youtube.ipa "$IPA_URL"
+          ls -l youtube.ipa
+          actual=$(shasum -a 256 youtube.ipa | cut -d' ' -f1)
+          echo "IPA SHA-256: $actual"
+          if [ -n "$IPA_SHA256" ] && [ "$(echo "$IPA_SHA256" | tr 'A-F' 'a-f')" != "$actual" ]; then
+            echo "::error::SHA-256 mismatch. Expected $IPA_SHA256, got $actual."
+            exit 1
+          fi
+          if ! unzip -l youtube.ipa | grep -q 'Payload/YouTube.app/Info.plist'; then
+            echo "::error::This file is not a YouTube IPA (no Payload/YouTube.app). Check the link is a direct download."
+            exit 1
+          fi
+
+      - name: Download icons
+        env:
+          ICON_URL: ${{ inputs.icon_url }}
+          ALT_ICON_URLS: ${{ inputs.alt_icon_urls }}
+        run: |
+          mkdir -p icons
+          args=()
+          if [ -n "$ICON_URL" ]; then
+            curl -fL --retry 3 -o icons/main "$ICON_URL"
+            args+=(--icon icons/main)
+          fi
+          i=0
+          IFS=',' read -ra entries <<< "$ALT_ICON_URLS"
+          for entry in "${entries[@]}"; do
+            entry="$(echo "$entry" | xargs)"
+            [ -z "$entry" ] && continue
+            name="${entry%%=*}"; url="${entry#*=}"
+            if [ "$name" = "$entry" ] || [ -z "$url" ]; then
+              echo "::warning::Skipping '$entry' (use Name=URL)."
+              continue
+            fi
+            i=$((i + 1))
+            curl -fL --retry 3 -o "icons/alt$i" "$url"
+            args+=(--alt "$name=icons/alt$i")
+          done
+          printf '%s\n' "${args[@]}" > icons/args.txt
+
+      - name: Set name and icons
+        env:
+          DISPLAY_NAME: ${{ inputs.display_name }}
+          BUNDLE_ID: ${{ inputs.bundle_id }}
+        run: |
+          unzip -q youtube.ipa -d ipa
+          app=$(find ipa/Payload -maxdepth 1 -name '*.app' | head -n 1)
+          args=()
+          while IFS= read -r line; do [ -n "$line" ] && args+=("$line"); done < icons/args.txt
+          if [ -n "$BUNDLE_ID" ]; then args+=(--bundle-id "$BUNDLE_ID"); fi
+          python3 scripts/patch_app.py "$app" --name "$DISPLAY_NAME" "${args[@]}"
+          (cd ipa && zip -qry ../patched.ipa .)
+          rm -rf ipa youtube.ipa
+
+      - name: Inject tweaks
+        run: |
+          # -u remove device restrictions, -w remove Watch app, -e remove extensions (helps free
+          # Apple IDs), -f inject these files.
+          cyan -i patched.ipa -o YTHelper.ipa -uwef debs/*.deb
+          ls -l YTHelper.ipa
+          shasum -a 256 YTHelper.ipa
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: YTHelper-ipa
+          path: YTHelper.ipa
+          retention-days: 7
+          if-no-files-found: error
