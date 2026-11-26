@@ -1,5 +1,8 @@
 #import "YTHDownloader.h"
 #import <AVFoundation/AVFoundation.h>
+#include <ctype.h>
+#include <limits.h>
+#include <string.h>
 
 @implementation YTHStream
 @end
@@ -30,14 +33,34 @@ static NSError *YTHError(NSInteger code, NSString *message) {
     return [NSError errorWithDomain:@"YTHelper" code:code userInfo:@{NSLocalizedDescriptionKey: message}];
 }
 
-// Parses "bytes START-END/TOTAL" ("*" total = unknown). Returns NO if missing or malformed.
-static BOOL YTHParseContentRange(NSString *header, long long *start, long long *total) {
-    if (!header.length) return NO;
-    long long s = -1, e = -1, t = -1;
-    int matched = sscanf(header.UTF8String, "bytes %lld-%lld/%lld", &s, &e, &t);
-    if (matched < 2) return NO;
+static BOOL YTHReadNumber(const char **p, long long *out) {
+    const char *s = *p;
+    if (!isdigit((unsigned char)*s)) return NO;
+    long long v = 0;
+    while (isdigit((unsigned char)*s)) {
+        if (v > (LLONG_MAX - 9) / 10) return NO; // overflow
+        v = v * 10 + (*s++ - '0');
+    }
+    *out = v;
+    *p = s;
+    return YES;
+}
+
+// Strictly parses "bytes START-END/TOTAL" or "bytes START-END/*" (total = -1 for "*").
+// Rejects anything else, including a missing "/TOTAL", END < START or END >= TOTAL.
+static BOOL YTHParseContentRange(NSString *header, long long *start, long long *end, long long *total) {
+    const char *h = header.UTF8String;
+    if (!h || strncmp(h, "bytes ", 6) != 0) return NO;
+    const char *p = h + 6;
+    long long s, e, t = -1;
+    if (!YTHReadNumber(&p, &s) || *p++ != '-' || !YTHReadNumber(&p, &e) || *p++ != '/') return NO;
+    if (*p == '*') p++;
+    else if (!YTHReadNumber(&p, &t)) return NO;
+    while (*p == ' ' || *p == '\t') p++;
+    if (*p != '\0' || e < s || (t >= 0 && e >= t)) return NO;
     *start = s;
-    *total = matched == 3 ? t : -1;
+    *end = e;
+    *total = t;
     return YES;
 }
 
@@ -92,8 +115,13 @@ static BOOL YTHParseContentRange(NSString *header, long long *start, long long *
         [self finishWithError:nil];
         return;
     }
-    long long start = -1, rangeTotal = -1;
-    if (!YTHParseContentRange(http.allHeaderFields[@"Content-Range"], &start, &rangeTotal) || start != self.offset) {
+    // A 206 must describe exactly the bytes we got, starting where we left off, and must not
+    // change the file size mid-download. Otherwise a short body could look like a finished file.
+    long long start = -1, end = -1, rangeTotal = -1;
+    if (!YTHParseContentRange([http valueForHTTPHeaderField:@"Content-Range"], &start, &end, &rangeTotal) ||
+        start != self.offset ||
+        (long long)data.length != end - start + 1 ||
+        (self.total >= 0 && rangeTotal >= 0 && rangeTotal != self.total)) {
         [self finishWithError:YTHError(5, @"YouTube sent an unexpected part of the file. Try again.")];
         return;
     }
@@ -102,11 +130,11 @@ static BOOL YTHParseContentRange(NSString *header, long long *start, long long *
         return;
     }
     self.offset += data.length;
-    if (rangeTotal > 0) self.total = rangeTotal;
+    if (rangeTotal >= 0) self.total = rangeTotal;
     if (self.total > 0)
         [self.job setStatus:[NSString stringWithFormat:@"%@ %d%%", self.label, (int)(self.offset * 100 / self.total)]];
-    if (self.total > 0 && self.offset >= self.total) [self finishWithError:nil];
-    else if (self.total <= 0 && (long long)data.length < YTHChunkSize) [self finishWithError:nil]; // unknown size, short read = end
+    if (self.total >= 0 && self.offset >= self.total) [self finishWithError:nil];
+    else if (self.total < 0 && (long long)data.length < YTHChunkSize) [self finishWithError:nil]; // size "*": short read = end
     else [self next];
 }
 
