@@ -31,40 +31,83 @@ static BOOL gBusy;
     dispatch_async(dispatch_get_main_queue(), ^{ self.progressAlert.message = status; });
 }
 
+static NSError *YTHError(NSInteger code, NSString *message) {
+    return [NSError errorWithDomain:@"YTHelper" code:code userInfo:@{NSLocalizedDescriptionKey: message}];
+}
+
+// Parses "bytes START-END/TOTAL". Returns NO if the header is missing or malformed.
+static BOOL YTHParseContentRange(NSString *header, long long *start, long long *total) {
+    NSScanner *scanner = [NSScanner scannerWithString:header ?: @""];
+    long long s = -1, e = -1, t = -1;
+    if (![scanner scanString:@"bytes" intoString:nil] || ![scanner scanLongLong:&s] ||
+        ![scanner scanString:@"-" intoString:nil] || ![scanner scanLongLong:&e] ||
+        ![scanner scanString:@"/" intoString:nil]) return NO;
+    if (![scanner scanLongLong:&t]) t = -1; // "*" means unknown total
+    *start = s;
+    *total = t;
+    return YES;
+}
+
 // Downloads url to file in 10 MB ranges. Calls done(error) on a background queue.
 - (void)fetch:(NSURL *)url to:(NSURL *)file label:(NSString *)label done:(void (^)(NSError *))done {
-    [[NSFileManager defaultManager] createFileAtPath:file.path contents:nil attributes:nil];
-    NSFileHandle *handle = [NSFileHandle fileHandleForWritingToURL:file error:nil];
+    NSError *fileError = nil;
+    if (![[NSFileManager defaultManager] createFileAtPath:file.path contents:nil attributes:nil]) {
+        done(YTHError(3, @"Couldn't create a file for the download."));
+        return;
+    }
+    NSFileHandle *handle = [NSFileHandle fileHandleForWritingToURL:file error:&fileError];
+    if (!handle) {
+        done(fileError ?: YTHError(3, @"Couldn't open the download file."));
+        return;
+    }
     __block long long offset = 0, total = -1;
     __block void (^next)(void);
     __weak typeof(self) weakSelf = self;
     void (^finishFetch)(NSError *) = ^(NSError *error) {
-        [handle closeFile];
+        [handle closeAndReturnError:nil];
         next = nil; // break the self-referencing block
         done(error);
     };
     next = ^{
         typeof(self) job = weakSelf;
-        if (!job || job.cancelled) { finishFetch([NSError errorWithDomain:@"YTHelper" code:-999 userInfo:@{NSLocalizedDescriptionKey: @"Cancelled"}]); return; }
+        if (!job || job.cancelled) { finishFetch(YTHError(-999, @"Cancelled")); return; }
         NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:url];
         [req setValue:[NSString stringWithFormat:@"bytes=%lld-%lld", offset, offset + YTHChunkSize - 1] forHTTPHeaderField:@"Range"];
         [[job.session dataTaskWithRequest:req completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
             NSHTTPURLResponse *http = (NSHTTPURLResponse *)response;
             if (error || (http.statusCode != 200 && http.statusCode != 206) || data.length == 0) {
                 // Pass network errors through unchanged so a cancel keeps code -999.
-                finishFetch(error ?: [NSError errorWithDomain:@"YTHelper" code:http.statusCode userInfo:@{NSLocalizedDescriptionKey:
-                    [NSString stringWithFormat:@"YouTube refused the download (HTTP %ld).", (long)http.statusCode]}]);
+                finishFetch(error ?: YTHError(http.statusCode,
+                    [NSString stringWithFormat:@"YouTube refused the download (HTTP %ld).", (long)http.statusCode]));
                 return;
             }
-            [handle writeData:data];
+            NSError *writeError = nil;
+            if (http.statusCode == 200) {
+                // The server ignored Range and sent the whole file. Whatever we wrote before is
+                // replaced so the output can't contain earlier chunks plus a full copy.
+                if (![handle truncateAtOffset:0 error:&writeError] || ![handle writeData:data error:&writeError]) {
+                    finishFetch(writeError ?: YTHError(4, @"Couldn't write the download to storage."));
+                    return;
+                }
+                offset = total = data.length;
+                finishFetch(nil);
+                return;
+            }
+            long long start = -1, rangeTotal = -1;
+            if (!YTHParseContentRange(http.allHeaderFields[@"Content-Range"], &start, &rangeTotal) || start != offset) {
+                finishFetch(YTHError(5, @"YouTube sent an unexpected part of the file. Try again."));
+                return;
+            }
+            if (![handle writeData:data error:&writeError]) {
+                finishFetch(writeError ?: YTHError(4, @"Couldn't write the download to storage."));
+                return;
+            }
             offset += data.length;
-            NSString *range = http.allHeaderFields[@"Content-Range"]; // "bytes 0-10485759/123456789"
-            if (total < 0 && range) total = [[range componentsSeparatedByString:@"/"].lastObject longLongValue];
-            if (http.statusCode == 200) total = offset; // server ignored Range and sent everything
+            if (rangeTotal > 0) total = rangeTotal;
             if (total > 0)
                 [job setStatus:[NSString stringWithFormat:@"%@ %d%%", label, (int)(offset * 100 / total)]];
             if (total > 0 && offset >= total) finishFetch(nil);
-            else if ((long long)data.length < YTHChunkSize && total <= 0) finishFetch(nil);
+            else if (total <= 0 && (long long)data.length < YTHChunkSize) finishFetch(nil); // unknown size, short read = end
             else next();
         }] resume];
     };
@@ -162,13 +205,23 @@ static NSString *YTHSafeFileName(NSString *title) {
         });
     };
 
-    NSURL *audioFile = [job.workDir URLByAppendingPathComponent:@"audio.mp4"];
-    NSURL *videoFile = [job.workDir URLByAppendingPathComponent:@"video.mp4"];
+    // Raw streams and finished files live in different folders so a video titled "video"
+    // can't overwrite the raw video.mp4. Raw files keep real extensions for AVFoundation.
+    NSURL *rawDir = [job.workDir URLByAppendingPathComponent:@"raw" isDirectory:YES];
+    NSURL *outDir = [job.workDir URLByAppendingPathComponent:@"out" isDirectory:YES];
+    NSError *dirError = nil;
+    if (![[NSFileManager defaultManager] createDirectoryAtURL:rawDir withIntermediateDirectories:YES attributes:nil error:&dirError] ||
+        ![[NSFileManager defaultManager] createDirectoryAtURL:outDir withIntermediateDirectories:YES attributes:nil error:&dirError]) {
+        finish(nil, dirError);
+        return;
+    }
+    NSURL *audioFile = [rawDir URLByAppendingPathComponent:@"audio.m4a"];
+    NSURL *videoFile = [rawDir URLByAppendingPathComponent:@"video.mp4"];
 
     if (audioOnly) {
         [job fetch:audio.URL to:audioFile label:@"Audio" done:^(NSError *error) {
             if (error) { finish(nil, error); return; }
-            NSURL *out = [job.workDir URLByAppendingPathComponent:[job.title stringByAppendingPathExtension:@"m4a"]];
+            NSURL *out = [outDir URLByAppendingPathComponent:[job.title stringByAppendingPathExtension:@"m4a"]];
             [job setStatus:@"Saving…"];
             [self exportAsset:[AVURLAsset URLAssetWithURL:audioFile options:nil] to:out type:AVFileTypeAppleM4A done:^(NSError *e) { finish(out, e); }];
         }];
@@ -179,9 +232,10 @@ static NSString *YTHSafeFileName(NSString *title) {
         // Only the 360p progressive file is available; it already has sound.
         [job fetch:progressive.URL to:videoFile label:@"Video" done:^(NSError *error) {
             if (error) { finish(nil, error); return; }
-            NSURL *out = [job.workDir URLByAppendingPathComponent:[job.title stringByAppendingPathExtension:@"mp4"]];
-            [[NSFileManager defaultManager] moveItemAtURL:videoFile toURL:out error:nil];
-            finish(out, nil);
+            NSURL *out = [outDir URLByAppendingPathComponent:[job.title stringByAppendingPathExtension:@"mp4"]];
+            NSError *moveError = nil;
+            if ([[NSFileManager defaultManager] moveItemAtURL:videoFile toURL:out error:&moveError]) finish(out, nil);
+            else finish(nil, moveError);
         }];
         return;
     }
@@ -191,7 +245,7 @@ static NSString *YTHSafeFileName(NSString *title) {
         [job fetch:audio.URL to:audioFile label:@"Audio" done:^(NSError *error2) {
             if (error2) { finish(nil, error2); return; }
             [job setStatus:@"Merging…"];
-            NSURL *out = [job.workDir URLByAppendingPathComponent:[job.title stringByAppendingPathExtension:@"mp4"]];
+            NSURL *out = [outDir URLByAppendingPathComponent:[job.title stringByAppendingPathExtension:@"mp4"]];
             [self mergeVideo:videoFile audio:audioFile to:out done:^(NSError *e) { finish(out, e); }];
         }];
     }];
@@ -203,7 +257,7 @@ static NSString *YTHSafeFileName(NSString *title) {
     AVAssetTrack *vt = [v tracksWithMediaType:AVMediaTypeVideo].firstObject;
     AVAssetTrack *at = [a tracksWithMediaType:AVMediaTypeAudio].firstObject;
     if (!vt || !at) {
-        done([NSError errorWithDomain:@"YTHelper" code:1 userInfo:@{NSLocalizedDescriptionKey: @"The downloaded streams couldn't be read."}]);
+        done(YTHError(1, @"The downloaded streams couldn't be read."));
         return;
     }
     AVMutableComposition *comp = [AVMutableComposition composition];
@@ -221,12 +275,16 @@ static NSString *YTHSafeFileName(NSString *title) {
 
 + (void)exportAsset:(AVAsset *)asset to:(NSURL *)out type:(AVFileType)type done:(void (^)(NSError *))done {
     AVAssetExportSession *export = [AVAssetExportSession exportSessionWithAsset:asset presetName:AVAssetExportPresetPassthrough];
+    if (!export || ![export.supportedFileTypes containsObject:type]) {
+        done(YTHError(2, @"This video's format can't be saved as a file on this device."));
+        return;
+    }
     export.outputURL = out;
     export.outputFileType = type;
     export.shouldOptimizeForNetworkUse = YES;
     [export exportAsynchronouslyWithCompletionHandler:^{
         if (export.status == AVAssetExportSessionStatusCompleted) done(nil);
-        else done(export.error ?: [NSError errorWithDomain:@"YTHelper" code:2 userInfo:@{NSLocalizedDescriptionKey: @"Couldn't save the file."}]);
+        else done(export.error ?: YTHError(2, @"Couldn't save the file."));
     }];
 }
 
