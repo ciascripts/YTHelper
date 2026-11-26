@@ -8,7 +8,7 @@ DEPS_DIR ?= $(THEOS_PROJECT_DIR)/../deps
 include $(THEOS)/makefiles/common.mk
 
 TWEAK_NAME = YTHelper
-$(TWEAK_NAME)_FILES = Ads.x Branding.x Settings.x Download.x YTHDownloader.m
+$(TWEAK_NAME)_FILES = Ads.x Background.x Branding.x Settings.x Download.x YTHDownloader.m
 $(TWEAK_NAME)_CFLAGS = -fobjc-arc -I$(DEPS_DIR)
 $(TWEAK_NAME)_FRAMEWORKS = UIKit Foundation AVFoundation CoreMedia PhotosUI
 
